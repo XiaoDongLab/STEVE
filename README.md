@@ -401,7 +401,7 @@ Additional outputs:
 
 - Reference label quality matters (prefer FACS or strong expert curation)
 - Subsampling strong + Novel weak → pipeline absorbs unseen types
-- Batch effects and dataset complexity reduce performance (expected; STEVE quantifies this)
+- Batch effects and dataset complexity reduce performance 
 - Adjust `--odds_cutoff` to control conservativeness:
 
   - Higher cutoff → more unknown calls (conservative)
