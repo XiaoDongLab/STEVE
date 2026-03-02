@@ -397,7 +397,7 @@ Additional outputs:
 
 ---
 
-# Best Practices (Aligned with Manuscript)
+# Best Practices 
 
 - Reference label quality matters (prefer FACS or strong expert curation)
 - Subsampling strong + Novel weak → pipeline absorbs unseen types
