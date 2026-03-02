@@ -3,12 +3,12 @@
 suppressPackageStartupMessages({
   library(optparse)
   library(Seurat)
-  library(SeuratDisk)
+  library(SeuratObject)     # SaveSeuratRds / LoadSeuratRds
   library(sctransform)
   library(magrittr)
   library(ggplot2)
   library(MASS)            # kde2d
-  library(harmony)
+  library(harmony)         # RunHarmony
   library(ComplexHeatmap)
   library(circlize)
   library(tidyr)
@@ -19,40 +19,39 @@ suppressPackageStartupMessages({
 # ============================================================
 
 msg <- function(...) cat(sprintf("[%s] ", format(Sys.time(), "%Y-%m-%d %H:%M:%S")), sprintf(...), "\n")
+`%||%` <- function(a, b) if (!is.null(a)) a else b
 
 ensure_dir <- function(path) {
   dir.create(path, showWarnings = FALSE, recursive = TRUE)
   invisible(path)
 }
 
-safe_assay5 <- function(obj, assay = "RNA") {
-  # Your original scripts cast RNA assay to Assay5 (Seurat v5). Keep it, but safely.
-  if (!assay %in% names(obj@assays)) return(obj)
-  try({
-    obj[[assay]] <- as(object = obj[[assay]], Class = "Assay5")
-  }, silent = TRUE)
-  obj
-}
-
-read_h5seurat <- function(path, assay = "RNA") {
-  if (!file.exists(path)) stop("File not found: ", path)
-  obj <- LoadH5Seurat(path, assays = assay)
-  obj <- safe_assay5(obj, assay = assay)
-  obj
+# IMPORTANT: Seurat subset() does not like get("colname") inside subset=
+# This helper subsets by meta.data column using explicit cell names.
+subset_by_meta <- function(obj, col, values, invert = FALSE) {
+  md <- obj@meta.data
+  if (!col %in% colnames(md)) {
+    stop("Metadata column not found: ", col, "\nAvailable columns: ",
+         paste(colnames(md), collapse = ", "))
+  }
+  keep <- md[[col]] %in% values
+  if (invert) keep <- !keep
+  cells_keep <- rownames(md)[which(keep)]
+  subset(obj, cells = cells_keep)
 }
 
 filter_min_cells <- function(obj, label_col, min_cells = 10) {
-  if (!label_col %in% colnames(obj@meta.data)) {
-    stop("Label column not found in meta.data: ", label_col)
+  md <- obj@meta.data
+  if (!label_col %in% colnames(md)) {
+    stop("Label column not found in meta.data: ", label_col, "\nAvailable columns: ",
+         paste(colnames(md), collapse = ", "))
   }
-  ct <- table(obj@meta.data[[label_col]])
-  keep <- names(ct[ct > min_cells])
-  obj <- subset(obj, subset = get(label_col) %in% keep)
-  obj
+  ct <- table(md[[label_col]])
+  keep_types <- names(ct[ct > min_cells])
+  subset_by_meta(obj, label_col, keep_types, invert = FALSE)
 }
 
 get_palette <- function(n) {
-  # Prefer scCustomize palette if available, otherwise fallback.
   if (requireNamespace("scCustomize", quietly = TRUE)) {
     cols <- scCustomize::DiscretePalette_scCustomize(num_colors = max(36, n), palette = "polychrome")
   } else {
@@ -61,22 +60,11 @@ get_palette <- function(n) {
   cols[seq_len(n)]
 }
 
-resolve_integration_method <- function(method_name) {
-  # Seurat v5 IntegrateLayers can accept a function or (sometimes) a string.
-  # We support both: if string doesn't resolve to function, pass string through.
-  if (is.function(method_name)) return(method_name)
-  if (!is.character(method_name) || length(method_name) != 1) return(method_name)
-  
-  # try to resolve
-  fn <- NULL
-  for (env in list(asNamespace("Seurat"), .GlobalEnv)) {
-    if (exists(method_name, envir = env, inherits = TRUE)) {
-      fn <- get(method_name, envir = env, inherits = TRUE)
-      if (is.function(fn)) return(fn)
-    }
-  }
-  # fallback: return string (Seurat may handle it)
-  method_name
+read_seurat_rds <- function(path, assay = "RNA") {
+  if (!file.exists(path)) stop("File not found: ", path)
+  obj <- LoadSeuratRds(path)
+  if (assay %in% Assays(obj)) DefaultAssay(obj) <- assay
+  obj
 }
 
 # ============================================================
@@ -85,45 +73,83 @@ resolve_integration_method <- function(method_name) {
 
 steve_integrate <- function(ref_obj,
                             query_obj,
-                            integration = "HarmonyIntegration",
+                            integration = "harmony",
                             dims = 1:20,
                             cluster_resolution = 0.8,
                             seed = 123,
                             reduction_name = "integrated.result",
-                            umap_name = "umap.result") {
+                            umap_name = "umap.result",
+                            harmony_group_col = "orig.ident") {
   
   set.seed(seed)
+  
+  # define the ONLY batch variable we want Harmony to correct: reference vs query
   ref_obj$orig.ident <- "reference"
   query_obj$orig.ident <- "query"
   
   combined <- merge(query_obj, ref_obj)
+  assay_use <- DefaultAssay(combined)
+  
+  # If this is a v5 assay with multiple counts.* layers, join them to ONE counts matrix.
+  # This prevents accidental "layer = one subset wins" behavior.
+  if (assay_use %in% Assays(combined)) {
+    lay <- tryCatch(Layers(combined[[assay_use]]), error = function(e) character(0))
+    if (length(lay) > 0) {
+      # join any counts.* layers into a single "counts"
+      combined <- tryCatch(
+        JoinLayers(combined, assay = assay_use, layers = "counts"),
+        error = function(e) combined
+      )
+    }
+  }
+  
+  # Ensure the harmony grouping column exists and is clean
+  if (!harmony_group_col %in% colnames(combined@meta.data)) {
+    stop("Harmony group column not found: ", harmony_group_col)
+  }
+  combined@meta.data[[harmony_group_col]] <- factor(combined@meta.data[[harmony_group_col]])
+  
+  # Standard preprocessing
   combined <- NormalizeData(combined, verbose = FALSE)
   combined <- FindVariableFeatures(combined, verbose = FALSE)
   combined <- ScaleData(combined, verbose = FALSE)
   combined <- RunPCA(combined, verbose = FALSE)
   
-  method_resolved <- resolve_integration_method(integration)
+  integration_lower <- tolower(integration)
   
-  if (exists("IntegrateLayers", where = asNamespace("Seurat"), inherits = TRUE)) {
-    combined <- IntegrateLayers(
+  # ---- Integration choice ----
+  # We DO NOT call IntegrateLayers() here, because it requires multiple normalized layers (data.*)
+  # and easily breaks depending on SeuratObject/Seurat versions.
+  # RunHarmony is stable and uses the grouping column explicitly.
+  if (integration_lower %in% c("harmony", "harmonyintegration", "runharmony")) {
+    combined <- RunHarmony(
       object = combined,
-      method = method_resolved,
-      orig.reduction = "pca",
-      new.reduction = reduction_name,
+      group.by.vars = harmony_group_col,
+      reduction = "pca",
+      dims.use = dims,
+      assay.use = assay_use,
+      reduction.save = reduction_name,
       verbose = FALSE
     )
+    reduction_for_umap <- reduction_name
+    
+  } else if (integration_lower %in% c("none", "no", "pca")) {
+    reduction_for_umap <- "pca"
+    
   } else {
-    # Fallback (older Seurat): classic anchor integration
-    msg("IntegrateLayers not found; falling back to FindIntegrationAnchors/IntegrateData.")
-    anchors <- FindIntegrationAnchors(object.list = list(ref_obj, query_obj), dims = dims)
-    combined <- IntegrateData(anchorset = anchors, dims = dims)
-    combined <- ScaleData(combined, verbose = FALSE)
-    combined <- RunPCA(combined, verbose = FALSE)
-    reduction_name <- "pca"
+    # If user passes something else, we just fall back to no integration (PCA)
+    msg("Unknown integration='%s' -> using PCA (no integration).", integration)
+    reduction_for_umap <- "pca"
   }
   
-  combined <- RunUMAP(combined, reduction = reduction_name, dims = dims, reduction.name = umap_name, verbose = FALSE)
-  combined <- FindNeighbors(combined, reduction = reduction_name, dims = dims, verbose = FALSE)
+  combined <- RunUMAP(
+    combined,
+    reduction = reduction_for_umap,
+    dims = dims,
+    reduction.name = umap_name,
+    verbose = FALSE
+  )
+  combined <- FindNeighbors(combined, reduction = reduction_for_umap, dims = dims, verbose = FALSE)
   combined <- FindClusters(combined, resolution = cluster_resolution, verbose = FALSE)
   
   combined
@@ -135,12 +161,15 @@ steve_build_kde_model <- function(combined,
                                   umap_name = "umap.result",
                                   grid_n = 200,
                                   laplace = 1) {
-  if (!ref_label_col %in% colnames(combined@meta.data)) stop("Missing ref_label_col in meta.data: ", ref_label_col)
+  
+  if (!ref_label_col %in% colnames(combined@meta.data)) {
+    stop("Missing ref_label_col in meta.data: ", ref_label_col, "\nAvailable columns: ",
+         paste(colnames(combined@meta.data), collapse = ", "))
+  }
   if (!umap_name %in% names(combined@reductions)) stop("Missing reduction: ", umap_name)
   
   ref <- subset(combined, subset = orig.ident == ref_ident)
   umap_all <- combined@reductions[[umap_name]]@cell.embeddings
-  umap_ref <- ref@reductions[[umap_name]]@cell.embeddings
   
   celltypes <- levels(droplevels(as.factor(ref@meta.data[[ref_label_col]])))
   if (length(celltypes) < 2) stop("Need at least 2 reference cell types after filtering.")
@@ -151,10 +180,9 @@ steve_build_kde_model <- function(combined,
   names(kde_list) <- celltypes
   
   for (ct in celltypes) {
-    ref_ct <- subset(ref, subset = get(ref_label_col) == ct)
+    ref_ct <- subset_by_meta(ref, ref_label_col, ct, invert = FALSE)
     coords <- ref_ct@reductions[[umap_name]]@cell.embeddings
     
-    # Avoid kde2d errors if exactly 1 cell
     if (nrow(coords) == 1) {
       coords <- rbind(coords, coords)
       coords[2, ] <- coords[2, ] + 0.1
@@ -165,7 +193,6 @@ steve_build_kde_model <- function(combined,
     kde_list[[ct]] <- list(x = kd$x, y = kd$y, likelihood = lik)
   }
   
-  # Empirical priors with Laplace smoothing (like your script)
   ref_labels <- ref@meta.data[[ref_label_col]]
   counts <- table(ref_labels)
   priors <- (as.numeric(counts[celltypes]) + laplace) / (length(ref_labels) + laplace * length(celltypes))
@@ -192,7 +219,6 @@ steve_predict <- function(combined,
   priors <- model$priors
   kde_list <- model$kde
   
-  # nearest grid index helper
   nearest_idx <- function(grid, value) which.min(abs(grid - value))
   
   pred_label <- character(nrow(umap))
@@ -204,7 +230,6 @@ steve_predict <- function(combined,
     x <- umap[i, 1]
     y <- umap[i, 2]
     
-    # compute posterior from likelihoods at nearest gridpoint
     lik <- numeric(length(celltypes))
     for (k in seq_along(celltypes)) {
       ct <- celltypes[k]
@@ -286,7 +311,6 @@ per_celltype_sens_spec <- function(true_labels, pred_labels) {
 }
 
 confusion_ratio <- function(true_labels, pred_labels) {
-  # column-normalized: within each true class, distribution over predicted
   true_levels <- levels(droplevels(as.factor(true_labels)))
   pred_levels <- levels(droplevels(as.factor(pred_labels)))
   
@@ -335,8 +359,6 @@ plot_heatmap <- function(mat, out_pdf, out_csv) {
   dev.off()
 }
 
-`%||%` <- function(a, b) if (!is.null(a)) a else b
-
 # ============================================================
 # Module 1: Subsampling Evaluation
 # ============================================================
@@ -346,7 +368,7 @@ steve_module_subsampling <- function(obj,
                                      ratios = seq(0.1, 0.9, by = 0.1),
                                      n_repeats = 10,
                                      outputdir = "./output_subsampling",
-                                     integration = "HarmonyIntegration",
+                                     integration = "harmony",
                                      dims = 1:20,
                                      cluster_resolution = 0.8,
                                      grid_n = 200,
@@ -360,11 +382,11 @@ steve_module_subsampling <- function(obj,
   all_summary <- list()
   
   for (r in ratios) {
-    for (rep in seq_len(n_repeats)) {
-      tag <- sprintf("ratio_%02d_rep_%02d", round(r * 100), rep)
+    for (iter in seq_len(n_repeats)) {
+      tag <- sprintf("ratio_%02d_iter_%02d", round(r * 100), iter)
       out <- file.path(outputdir, tag)
       ensure_dir(out)
-      set.seed(seed + rep + round(r * 1000))
+      set.seed(seed + iter + round(r * 1000))
       
       n <- ncol(obj)
       ref_n <- max(1, floor(n * r))
@@ -374,25 +396,28 @@ steve_module_subsampling <- function(obj,
       ref_obj <- obj[, ref_idx]
       query_obj <- obj[, query_idx]
       
-      combined <- steve_integrate(ref_obj, query_obj,
-                                  integration = integration,
-                                  dims = dims,
-                                  cluster_resolution = cluster_resolution,
-                                  seed = seed + rep)
+      combined <- steve_integrate(
+        ref_obj, query_obj,
+        integration = integration,
+        dims = dims,
+        cluster_resolution = cluster_resolution,
+        seed = seed + iter
+      )
       
-      # Create a plotting label: show ref truth; query as "query"
       combined$STEVE_plot <- "query"
-      combined@meta.data[colnames(subset(combined, subset = orig.ident == "reference")), "STEVE_plot"] <-
-        subset(combined, subset = orig.ident == "reference")@meta.data[[truth_col]]
+      ref_cells <- colnames(subset(combined, subset = orig.ident == "reference"))
+      combined@meta.data[ref_cells, "STEVE_plot"] <- combined@meta.data[ref_cells, truth_col]
       combined$STEVE_plot <- factor(combined$STEVE_plot)
       
-      plot_integrated_umap(combined, "STEVE_plot", file.path(out, "integrated_umap.pdf"),
-                           title = sprintf("Subsampling: ref=%.0f%%", r * 100))
+      plot_integrated_umap(
+        combined, "STEVE_plot",
+        file.path(out, "integrated_umap.pdf"),
+        title = sprintf("Subsampling: ref=%.0f%%", r * 100)
+      )
       
       model <- steve_build_kde_model(combined, ref_ident = "reference", ref_label_col = truth_col, grid_n = grid_n)
       pred <- steve_predict(combined, model, odds_cutoff = odds_cutoff, unknown_label = "unknown")
       
-      # Evaluate only query cells, comparing predicted vs true labels
       query_cells <- colnames(subset(combined, subset = orig.ident == "query"))
       pred_q <- pred[pred$cellid %in% query_cells, , drop = FALSE]
       
@@ -403,19 +428,19 @@ steve_module_subsampling <- function(obj,
       macro_sens <- mean(metrics$Sensitivity, na.rm = TRUE)
       macro_spec <- mean(metrics$Specificity, na.rm = TRUE)
       
-      # confusion heatmap (truth columns)
       mat <- confusion_ratio(truth_q, pred_q$pred)
-      plot_heatmap(mat,
-                   out_pdf = file.path(out, "confusion_heatmap.pdf"),
-                   out_csv = file.path(out, "confusion_heatmap.csv"))
+      plot_heatmap(
+        mat,
+        out_pdf = file.path(out, "confusion_heatmap.pdf"),
+        out_csv = file.path(out, "confusion_heatmap.csv")
+      )
       
-      # save predictions
       pred_q$truth <- truth_q
       write.csv(pred_q, file.path(out, "predictions_query.csv"), row.names = FALSE)
       
       all_summary[[length(all_summary) + 1]] <- data.frame(
         ratio = r,
-        repeat = rep,
+        iteration = iter,
         macro_sensitivity = macro_sens,
         macro_specificity = macro_spec,
         stringsAsFactors = FALSE
@@ -428,8 +453,7 @@ steve_module_subsampling <- function(obj,
   summary_df <- do.call(rbind, all_summary)
   write.csv(summary_df, file.path(outputdir, "summary_macro_metrics.csv"), row.names = FALSE)
   
-  # plot macro across runs
-  p <- ggplot(summary_df, aes(x = interaction(ratio, repeat, drop = TRUE))) +
+  p <- ggplot(summary_df, aes(x = interaction(ratio, iteration, drop = TRUE))) +
     geom_point(aes(y = macro_sensitivity, color = "Sensitivity")) +
     geom_point(aes(y = macro_specificity, color = "Specificity")) +
     theme_bw() +
@@ -449,7 +473,7 @@ steve_module_novel_cell <- function(obj,
                                     truth_col,
                                     outputdir = "./output_novel",
                                     n_repeats = 5,
-                                    integration = "HarmonyIntegration",
+                                    integration = "harmony",
                                     dims = 1:20,
                                     cluster_resolution = 0.8,
                                     grid_n = 200,
@@ -463,8 +487,8 @@ steve_module_novel_cell <- function(obj,
   celltypes <- levels(droplevels(as.factor(obj@meta.data[[truth_col]])))
   all_runs <- list()
   
-  for (rep in seq_len(n_repeats)) {
-    set.seed(seed + rep)
+  for (iter in seq_len(n_repeats)) {
+    set.seed(seed + iter)
     n <- ncol(obj)
     half <- floor(n / 2)
     ref_idx <- sample(seq_len(n), half, replace = FALSE)
@@ -473,18 +497,19 @@ steve_module_novel_cell <- function(obj,
     base_query <- obj[, query_idx]
     
     for (omit in celltypes) {
-      out <- file.path(outputdir, sprintf("rep_%02d_omit_%s", rep, gsub("[^A-Za-z0-9_\\-]", "_", omit)))
+      out <- file.path(outputdir, sprintf("iter_%02d_omit_%s", iter, gsub("[^A-Za-z0-9_\\-]", "_", omit)))
       ensure_dir(out)
       
-      # remove "omit" from reference
-      ref_obj <- subset(base_ref, subset = get(truth_col) != omit)
+      ref_obj <- subset_by_meta(base_ref, truth_col, omit, invert = TRUE)
       query_obj <- base_query
       
-      combined <- steve_integrate(ref_obj, query_obj,
-                                  integration = integration,
-                                  dims = dims,
-                                  cluster_resolution = cluster_resolution,
-                                  seed = seed + rep)
+      combined <- steve_integrate(
+        ref_obj, query_obj,
+        integration = integration,
+        dims = dims,
+        cluster_resolution = cluster_resolution,
+        seed = seed + iter
+      )
       
       model <- steve_build_kde_model(combined, ref_ident = "reference", ref_label_col = truth_col, grid_n = grid_n)
       pred <- steve_predict(combined, model, odds_cutoff = odds_cutoff, unknown_label = "unknown")
@@ -504,25 +529,22 @@ steve_module_novel_cell <- function(obj,
       novel_sens <- ifelse((TP + FN) > 0, TP / (TP + FN), NA_real_)
       novel_spec <- ifelse((TN + FP) > 0, TN / (TN + FP), NA_real_)
       
-      # Misclassification breakdown for omitted type
       mis <- sort(table(pred_q$pred[is_novel_true]), decreasing = TRUE)
       mis_df <- data.frame(pred = names(mis), n = as.integer(mis), stringsAsFactors = FALSE)
       write.csv(mis_df, file.path(out, "novel_misclassification_counts.csv"), row.names = FALSE)
       
-      # Save predictions
       pred_q$truth <- truth_q
       write.csv(pred_q, file.path(out, "predictions_query.csv"), row.names = FALSE)
       
-      run_row <- data.frame(
-        repeat = rep,
+      all_runs[[length(all_runs) + 1]] <- data.frame(
+        iteration = iter,
         omitted_type = omit,
         novel_sensitivity = novel_sens,
         novel_specificity = novel_spec,
         stringsAsFactors = FALSE
       )
-      all_runs[[length(all_runs) + 1]] <- run_row
       
-      msg("Novel eval rep=%d omit=%s (sens=%.3f spec=%.3f)", rep, omit, novel_sens, novel_spec)
+      msg("Novel eval iter=%d omit=%s (sens=%.3f spec=%.3f)", iter, omit, novel_sens, novel_spec)
     }
   }
   
@@ -534,7 +556,8 @@ steve_module_novel_cell <- function(obj,
     theme_bw() +
     theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
     scale_y_continuous(limits = c(0, 1)) +
-    labs(title = "Novel Cell Evaluation: sensitivity (detect omitted type as unknown)", x = "omitted type", y = "sensitivity")
+    labs(title = "Novel Cell Evaluation: sensitivity (detect omitted type as unknown)",
+         x = "omitted type", y = "sensitivity")
   ggsave(file.path(outputdir, "novel_sensitivity_plot.pdf"), p, width = 8, height = 3.5)
   
   out_df
@@ -546,10 +569,10 @@ steve_module_novel_cell <- function(obj,
 
 steve_module_benchmark <- function(obj,
                                    truth_col,
-                                   tool_col,
+                                   candidate_col,
                                    outputdir = "./output_benchmark",
                                    n_repeats = 5,
-                                   integration = "HarmonyIntegration",
+                                   integration = "harmony",
                                    dims = 1:20,
                                    cluster_resolution = 0.8,
                                    grid_n = 200,
@@ -558,14 +581,16 @@ steve_module_benchmark <- function(obj,
                                    seed = 123) {
   
   ensure_dir(outputdir)
-  if (!tool_col %in% colnames(obj@meta.data)) stop("Tool annotation column not found: ", tool_col)
+  if (!candidate_col %in% colnames(obj@meta.data)) {
+    stop("Candidate annotation column not found in meta.data: ", candidate_col, "\nAvailable columns: ",
+         paste(colnames(obj@meta.data), collapse = ", "))
+  }
   
   obj <- filter_min_cells(obj, truth_col, min_cells = min_cells)
-  
   all_runs <- list()
   
-  for (rep in seq_len(n_repeats)) {
-    set.seed(seed + rep)
+  for (iter in seq_len(n_repeats)) {
+    set.seed(seed + iter)
     n <- ncol(obj)
     half <- floor(n / 2)
     ref_idx <- sample(seq_len(n), half, replace = FALSE)
@@ -574,52 +599,54 @@ steve_module_benchmark <- function(obj,
     ref_obj <- obj[, ref_idx]
     query_obj <- obj[, query_idx]
     
-    combined <- steve_integrate(ref_obj, query_obj,
-                                integration = integration,
-                                dims = dims,
-                                cluster_resolution = cluster_resolution,
-                                seed = seed + rep)
+    combined <- steve_integrate(
+      ref_obj, query_obj,
+      integration = integration,
+      dims = dims,
+      cluster_resolution = cluster_resolution,
+      seed = seed + iter
+    )
     
-    # Evaluate tool labels vs truth (directly, on query subset)
     query_cells <- colnames(subset(combined, subset = orig.ident == "query"))
-    tool_q <- combined@meta.data[query_cells, tool_col]
+    cand_q <- combined@meta.data[query_cells, candidate_col]
     truth_q <- combined@meta.data[query_cells, truth_col]
     
-    tool_metrics <- per_celltype_sens_spec(truth_q, tool_q)
-    write.csv(tool_metrics, file.path(outputdir, sprintf("rep_%02d_tool_vs_truth_per_celltype.csv", rep)), row.names = FALSE)
+    tool_metrics <- per_celltype_sens_spec(truth_q, cand_q)
+    write.csv(tool_metrics, file.path(outputdir, sprintf("iter_%02d_candidate_vs_truth_per_celltype.csv", iter)),
+              row.names = FALSE)
     
-    tool_macro_sens <- mean(tool_metrics$Sensitivity, na.rm = TRUE)
-    tool_macro_spec <- mean(tool_metrics$Specificity, na.rm = TRUE)
+    cand_macro_sens <- mean(tool_metrics$Sensitivity, na.rm = TRUE)
+    cand_macro_spec <- mean(tool_metrics$Specificity, na.rm = TRUE)
     
-    # Optional: also compute STEVE predictions vs truth (pipeline-integrated baseline)
     model <- steve_build_kde_model(combined, ref_ident = "reference", ref_label_col = truth_col, grid_n = grid_n)
     pred <- steve_predict(combined, model, odds_cutoff = odds_cutoff, unknown_label = "unknown")
     pred_q <- pred[pred$cellid %in% query_cells, , drop = FALSE]
     
     steve_metrics <- per_celltype_sens_spec(truth_q, pred_q$pred)
-    write.csv(steve_metrics, file.path(outputdir, sprintf("rep_%02d_steve_vs_truth_per_celltype.csv", rep)), row.names = FALSE)
+    write.csv(steve_metrics, file.path(outputdir, sprintf("iter_%02d_steve_vs_truth_per_celltype.csv", iter)),
+              row.names = FALSE)
     
     steve_macro_sens <- mean(steve_metrics$Sensitivity, na.rm = TRUE)
     steve_macro_spec <- mean(steve_metrics$Specificity, na.rm = TRUE)
     
-    # Confusion heatmap for tool vs truth (truth columns)
-    mat_tool <- confusion_ratio(truth_q, tool_q)
-    plot_heatmap(mat_tool,
-                 out_pdf = file.path(outputdir, sprintf("rep_%02d_tool_confusion_heatmap.pdf", rep)),
-                 out_csv = file.path(outputdir, sprintf("rep_%02d_tool_confusion_heatmap.csv", rep)))
+    mat_tool <- confusion_ratio(truth_q, cand_q)
+    plot_heatmap(
+      mat_tool,
+      out_pdf = file.path(outputdir, sprintf("iter_%02d_candidate_confusion_heatmap.pdf", iter)),
+      out_csv = file.path(outputdir, sprintf("iter_%02d_candidate_confusion_heatmap.csv", iter))
+    )
     
-    run_row <- data.frame(
-      repeat = rep,
-      tool_macro_sensitivity = tool_macro_sens,
-      tool_macro_specificity = tool_macro_spec,
+    all_runs[[length(all_runs) + 1]] <- data.frame(
+      iteration = iter,
+      candidate_macro_sensitivity = cand_macro_sens,
+      candidate_macro_specificity = cand_macro_spec,
       steve_macro_sensitivity = steve_macro_sens,
       steve_macro_specificity = steve_macro_spec,
       stringsAsFactors = FALSE
     )
-    all_runs[[length(all_runs) + 1]] <- run_row
     
-    msg("Benchmark rep=%d tool(sens=%.3f spec=%.3f) steve(sens=%.3f spec=%.3f)",
-        rep, tool_macro_sens, tool_macro_spec, steve_macro_sens, steve_macro_spec)
+    msg("Benchmark iter=%d candidate(sens=%.3f spec=%.3f) steve(sens=%.3f spec=%.3f)",
+        iter, cand_macro_sens, cand_macro_spec, steve_macro_sens, steve_macro_spec)
   }
   
   out_df <- do.call(rbind, all_runs)
@@ -636,7 +663,7 @@ steve_module_transfer <- function(user_obj,
                                   ref_obj,
                                   ref_truth_col,
                                   outputdir = "./output_transfer",
-                                  integration = "HarmonyIntegration",
+                                  integration = "harmony",
                                   dims = 1:20,
                                   cluster_resolution = 0.8,
                                   grid_n = 200,
@@ -648,20 +675,24 @@ steve_module_transfer <- function(user_obj,
   ensure_dir(outputdir)
   ref_obj <- filter_min_cells(ref_obj, ref_truth_col, min_cells = min_cells)
   
-  combined <- steve_integrate(ref_obj, user_obj,
-                              integration = integration,
-                              dims = dims,
-                              cluster_resolution = cluster_resolution,
-                              seed = seed)
+  combined <- steve_integrate(
+    ref_obj, user_obj,
+    integration = integration,
+    dims = dims,
+    cluster_resolution = cluster_resolution,
+    seed = seed
+  )
   
-  # UMAP plot: reference labels + user gray
   combined$STEVE_plot <- "user"
-  combined@meta.data[colnames(subset(combined, subset = orig.ident == "reference")), "STEVE_plot"] <-
-    subset(combined, subset = orig.ident == "reference")@meta.data[[ref_truth_col]]
+  ref_cells <- colnames(subset(combined, subset = orig.ident == "reference"))
+  combined@meta.data[ref_cells, "STEVE_plot"] <- combined@meta.data[ref_cells, ref_truth_col]
   combined$STEVE_plot <- factor(combined$STEVE_plot)
   
-  plot_integrated_umap(combined, "STEVE_plot", file.path(outputdir, "integrated_umap.pdf"),
-                       title = "Reference Transfer Annotation")
+  plot_integrated_umap(
+    combined, "STEVE_plot",
+    file.path(outputdir, "integrated_umap.pdf"),
+    title = "Reference Transfer Annotation"
+  )
   
   model <- steve_build_kde_model(combined, ref_ident = "reference", ref_label_col = ref_truth_col, grid_n = grid_n)
   pred <- steve_predict(combined, model, odds_cutoff = odds_cutoff, unknown_label = "unknown")
@@ -670,17 +701,21 @@ steve_module_transfer <- function(user_obj,
   pred_u <- pred[pred$cellid %in% user_cells, , drop = FALSE]
   write.csv(pred_u, file.path(outputdir, "transfer_predictions_user.csv"), row.names = FALSE)
   
-  # If user_truth_col provided, evaluate sensitivity/specificity too
   if (!is.null(user_truth_col)) {
-    if (!user_truth_col %in% colnames(combined@meta.data)) stop("user_truth_col not in user meta.data: ", user_truth_col)
+    if (!user_truth_col %in% colnames(combined@meta.data)) {
+      stop("user_truth_col not in user meta.data: ", user_truth_col, "\nAvailable columns: ",
+           paste(colnames(combined@meta.data), collapse = ", "))
+    }
     truth_u <- combined@meta.data[pred_u$cellid, user_truth_col]
     metrics <- per_celltype_sens_spec(truth_u, pred_u$pred)
     write.csv(metrics, file.path(outputdir, "transfer_metrics_user_vs_truth.csv"), row.names = FALSE)
     
     mat <- confusion_ratio(truth_u, pred_u$pred)
-    plot_heatmap(mat,
-                 out_pdf = file.path(outputdir, "transfer_confusion_heatmap.pdf"),
-                 out_csv = file.path(outputdir, "transfer_confusion_heatmap.csv"))
+    plot_heatmap(
+      mat,
+      out_pdf = file.path(outputdir, "transfer_confusion_heatmap.pdf"),
+      out_csv = file.path(outputdir, "transfer_confusion_heatmap.csv")
+    )
   }
   
   pred_u
@@ -696,36 +731,36 @@ option_list <- list(
   make_option(c("-d", "--workdir"), type = "character", default = ".",
               help = "Working directory [default %default]"),
   make_option(c("-u", "--userdata"), type = "character", default = NULL,
-              help = "User dataset (.h5seurat). Required for all modules."),
+              help = "User dataset (.seurat.rds). Required for all modules."),
   make_option(c("-g", "--groundtruthdata"), type = "character", default = NULL,
-              help = "Reference dataset (.h5seurat). Required for transfer module."),
+              help = "Reference dataset (.seurat.rds). Required for transfer module."),
   make_option(c("-o", "--outputdir"), type = "character", default = "./output",
               help = "Output directory [default %default]"),
   
   make_option(c("-f", "--reference_annotation"), type = "character", default = "groundtruth",
-              help = "Reference/ground-truth label column in meta.data [default %default]"),
+              help = "Ground-truth label column in meta.data [default %default]"),
   make_option(c("-a", "--user_annotation"), type = "character", default = "user_annotation",
-              help = "Tool/user label column in meta.data (used by benchmark) [default %default]"),
+              help = "Candidate annotation column in meta.data (used by benchmark) [default %default]"),
   make_option(c("--user_truth_annotation"), type = "character", default = NULL,
               help = "Optional: user truth label column (for transfer evaluation) [default %default]"),
   
-  make_option(c("-i", "--integration"), type = "character", default = "HarmonyIntegration",
-              help = "Integration method passed to IntegrateLayers [default %default]"),
+  make_option(c("-i", "--integration"), type = "character", default = "harmony",
+              help = "Integration: harmony | none [default %default]"),
   make_option(c("--dims"), type = "character", default = "1:20",
-              help = "Dimensions for integration/UMAP, like '1:20' [default %default]"),
+              help = "Dimensions for PCA/Harmony/UMAP, like '1:20' [default %default]"),
   make_option(c("-r", "--cluster_resolution"), type = "double", default = 0.8,
               help = "FindClusters resolution [default %default]"),
   make_option(c("--grid_n"), type = "integer", default = 200,
               help = "KDE grid resolution (kde2d n=) [default %default]"),
   make_option(c("--odds_cutoff"), type = "double", default = 2,
-              help = "Posterior odds cutoff to call a label; else 'unknown' [default %default]"),
+              help = "Posterior odds cutoff; else 'unknown' [default %default]"),
   make_option(c("-x", "--min_cells"), type = "integer", default = 10,
-              help = "Filter cell types with <= min_cells in reference/truth [default %default]"),
+              help = "Filter cell types with <= min_cells [default %default]"),
   make_option(c("--seed"), type = "integer", default = 123,
               help = "Random seed [default %default]"),
   
-  # subsampling options
-  make_option(c("--ratios"), type = "character", default = "0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9",
+  make_option(c("--ratios"), type = "character",
+              default = "0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9",
               help = "Subsampling reference fractions (comma-separated) [default %default]"),
   make_option(c("--n_repeats"), type = "integer", default = 10,
               help = "Number of repeats (subsampling/novel/benchmark) [default %default]")
@@ -746,10 +781,11 @@ if (is.null(opt$userdata)) stop("--userdata is required.")
 msg("STEVE master starting. module=%s output=%s", opt$module, opt$outputdir)
 
 if (opt$module %in% c("subsampling", "novel", "benchmark")) {
-  obj <- read_h5seurat(opt$userdata, assay = "RNA")
+  obj <- read_seurat_rds(opt$userdata, assay = "RNA")
 }
 
 if (opt$module == "subsampling") {
+  
   steve_module_subsampling(
     obj = obj,
     truth_col = opt$reference_annotation,
@@ -766,6 +802,7 @@ if (opt$module == "subsampling") {
   )
   
 } else if (opt$module == "novel") {
+  
   steve_module_novel_cell(
     obj = obj,
     truth_col = opt$reference_annotation,
@@ -781,10 +818,11 @@ if (opt$module == "subsampling") {
   )
   
 } else if (opt$module == "benchmark") {
+  
   steve_module_benchmark(
     obj = obj,
     truth_col = opt$reference_annotation,
-    tool_col = opt$user_annotation,
+    candidate_col = opt$user_annotation,
     outputdir = opt$outputdir,
     n_repeats = opt$n_repeats,
     integration = opt$integration,
@@ -797,9 +835,11 @@ if (opt$module == "subsampling") {
   )
   
 } else if (opt$module == "transfer") {
+  
   if (is.null(opt$groundtruthdata)) stop("--groundtruthdata is required for module=transfer")
-  user_obj <- read_h5seurat(opt$userdata, assay = "RNA")
-  ref_obj <- read_h5seurat(opt$groundtruthdata, assay = "RNA")
+  
+  user_obj <- read_seurat_rds(opt$userdata, assay = "RNA")
+  ref_obj  <- read_seurat_rds(opt$groundtruthdata, assay = "RNA")
   
   steve_module_transfer(
     user_obj = user_obj,
