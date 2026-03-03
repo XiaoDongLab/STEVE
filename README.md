@@ -1,3 +1,43 @@
+# STEVE
+A quantitative framework developed to evaluate the accuracy and reliability of cell-type annotations.
+
+Version: 1.0.0
+
+Updated date: 2026.12.06
+
+Citation: Elijah Torbenson, Xiao Ma, Daniel J. Garry, Stephen C. Jameson, Zhengdong Zhang, Laura J. Niedernhofer, Lei Zhang, Meiyi Li, and Xiao Dong. STEVE: Single-cell Transcriptomics Expression Visualization and Evaluation. in review at Briefings in Bioinformatics.
+#####
+## Author and License
+
+Author: Elijah Torbenson? 
+
+Email: elijahtorbenson@creighton.edu
+
+Licensed under the GNU Affero General Public License version 3 or later.
+
+#####
+## Dependencies
+• R 4.4.1
+
+• dplyr 1.1.4
+
+• tidyr 1.3.1
+
+• ggplot2 3.5.1
+
+• lattice 0.22.6
+
+• caret 6.0.94
+
+• e1071 1.7.14
+
+
+## Release Notes
+
+• v1.0.0, 2024.12.06, 1st version uploades.
+
+
+
 # STEVE — Conceptual Overview
 
 STEVE is a dataset-specific evaluation framework for **cell-type annotation** in scRNA-seq.
