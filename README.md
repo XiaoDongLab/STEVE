@@ -125,7 +125,7 @@ install.packages("scCustomize") # optional
 STEVE expects:
 
 ```
-.h5seurat
+.rds (seurat object)
 ```
 
 ### Key Principle: Labels Live in `meta.data`
