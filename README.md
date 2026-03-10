@@ -5,7 +5,7 @@ Version: 1.0.0
 
 Updated date: 2026.12.06
 
-Citation: Elijah Torbenson, Xiao Ma, Daniel J. Garry, Stephen C. Jameson, Zhengdong Zhang, Laura J. Niedernhofer, Lei Zhang, Meiyi Li, and Xiao Dong. STEVE: Single-cell Transcriptomics Expression Visualization and Evaluation. in review at Briefings in Bioinformatics.
+Citation: Elijah Torbenson, Xiao Ma, Daniel J. Garry, Stephen C. Jameson, Zhengdong Zhang, Laura J. Niedernhofer, Lei Zhang, Meiyi Li, and Xiao Dong. STEVE: Single-cell Transcriptomics Expression Visualization and Evaluation. in submission.
 #####
 ## Author and License
 
