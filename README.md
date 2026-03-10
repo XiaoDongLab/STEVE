@@ -9,9 +9,11 @@ Citation: Elijah Torbenson, Xiao Ma, Daniel J. Garry, Stephen C. Jameson, Zhengd
 #####
 ## Author and License
 
-Author: Elijah Torbenson? 
+Authors: Elijah Torbenson, Meiyi Li
 
 Email: elijahtorbenson@creighton.edu
+
+Email: limeiyi@sibs.ac.cn
 
 Licensed under the GNU Affero General Public License version 3 or later.
 
